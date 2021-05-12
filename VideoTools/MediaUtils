@@ -1,0 +1,268 @@
+# coding:utf-8
+import os
+import re
+import json
+import certifi
+import hashlib
+from time import time
+from numpy import var
+from urllib3 import PoolManager, Timeout
+
+
+timeout = Timeout(5.0)
+pool = PoolManager(cert_reqs='CERT_REQUIRED', ca_certs=certifi.where(), timeout=timeout)
+
+
+class MediaUtils:
+    FF_CMD = 'ffprobe -v quiet -show_format -show_streams -show_frames -of json -i %s'  # 显示概要信息/流信息/帧数据
+    FF_OUT = "ffmpeg -v quiet -i %s -vf select='eq(pict_type\\,%s)' -vsync 2 -f image2 %s/%s_%s_%%d.jpg"  # 导出指定帧
+
+    @staticmethod
+    def get_streams(info):
+        return info.get('streams', None)
+
+    @staticmethod
+    def get_frames(info):
+        return info.get('frames', None)
+
+    @staticmethod
+    def get_format(info):
+        return info.get('format', None)
+
+    @staticmethod
+    def get_video_streams(streams):
+        for i in streams:
+            if i.get('codec_type') == 'video':
+                return i
+        return list()
+
+    @staticmethod
+    def get_audio_streams(streams):
+        tmp = list()  # 音频数最少为1，故返回list
+        for i in streams:
+            if i.get('codec_type') == 'audio':
+                tmp.append(i)
+        return tmp
+
+    @staticmethod
+    def get_media_info(filepath):
+        info_str = os.popen(MediaUtils.FF_CMD % filepath, 'r', 1).read()
+        print(MediaUtils.FF_CMD % filepath)
+        info_json = json.loads(info_str)
+        return info_json
+
+    @staticmethod
+    def check_quiet_video(frames):
+        is_quiet = True
+        audio_frames = [i for i in frames if i['media_type'] == 'audio']
+        audio_size = {}
+        for i in audio_frames:
+            if i['stream_index'] not in audio_size.keys():
+                audio_size[i['stream_index']] = []
+            audio_size[i['stream_index']].append(int(i['pkt_size']))
+        for idx, val in audio_size.items():
+            variance = var(val)
+            # print('音轨：%s， 音轨波动方差：%f' % (idx, variance))
+            if variance > 10:
+                is_quiet = False
+        return is_quiet
+
+    @staticmethod
+    def output_frame(filepath, target, prefix, frame_type):  # 拿到i/p/b帧的图片
+        if not os.path.exists(target):
+            os.mkdir(target, 777)
+        if not os.path.isdir(target):
+            raise ValueError('target is not dir!!!')
+        frame_type = frame_type.upper()
+        if frame_type in ('I', 'P', 'B'):
+            cmd = MediaUtils.FF_OUT % (filepath, frame_type, target, prefix, frame_type)
+            print(cmd)
+            res = os.popen(cmd, 'r', 1).read()
+            print(res)
+        else:
+            raise ValueError('frame_type should be I/P/B')
+
+    @staticmethod
+    def get_cdn_resource_md5(resource_url, user_agent=None):
+        header = {'User-Agent': user_agent} if user_agent else None
+        res = pool.request('GET', resource_url, headers=header)
+        return MediaUtils.get_file_md5(res.data)
+
+    @staticmethod
+    def get_file_md5(file_bytes):
+        md = hashlib.md5()
+        md.update(file_bytes)
+        return md.hexdigest()
+
+
+class MediaFile:
+    def __init__(self, source, debug=False, auto_download=True):
+        if re.match('https?://.*', source, re.I):
+            if debug:
+                print('文件来源：互联网')
+            if auto_download:
+                file = pool.request('GET', source, retries=10)
+                if str(file.status) != '200':
+                    raise ValueError('下载文件失败，清检查网络')
+                file_data = file.data
+                file_name = os.path.join('/tmp', '.resource_cache%d' % int(time() * 1000))
+                with open(file_name, 'wb') as f:
+                    f.write(file_data)
+                print('缓存文件：', file_name)
+                source = file_name
+            self.__md5 = None
+        else:
+            if not os.path.exists(source) or not os.path.isfile(source):
+                raise ValueError('未找到文件')
+            with open(source, 'rb') as f:
+                file_data = f.read()
+            self.__md5 = MediaUtils.get_file_md5(file_data)
+        self.__media_info = MediaUtils.get_media_info(source)
+        self.__streams = MediaUtils.get_streams(self.__media_info)
+        self.__format = MediaUtils.get_format(self.__media_info)
+        self.__frames = MediaUtils.get_frames(self.__media_info)
+        self.__video_streams = MediaUtils.get_video_streams(self.__streams)
+        self.__audio_streams = MediaUtils.get_audio_streams(self.__streams)
+        self.is_quiet_video = True
+        if self.__audio_streams:
+            self.is_quiet_video = MediaUtils.check_quiet_video(self.__frames)
+
+    # 获取文件MD5
+    def get_file_md5(self):
+        return self.__md5
+
+    # 文件大小，1024进制
+    def get_format_size(self):
+        return int(self.__format.get('size'))
+
+    # 获取整体码率
+    def get_format_bit_rate(self):
+        return int(self.__format.get('bit_rate'))
+
+    # 获取整体时长
+    def get_format_duration(self):
+        return float(self.__format.get('duration'))
+
+    # 视图编码
+    def get_video_codec_name(self):
+        return self.__video_streams.get('codec_name')
+
+    # 视图宽
+    def get_video_codec_width(self):
+        if self.__video_streams.get('width'):
+            return self.__video_streams.get('width')
+        return 0
+
+    # 视图高
+    def get_video_codec_height(self):
+        if self.__video_streams.get('height'):
+            return self.__video_streams.get('height')
+        return 0
+
+    # 视频时长(s)
+    def get_video_duration(self):
+        if self.__video_streams.get('duration'):
+            return round(float(self.__video_streams.get('duration')), 4)
+        return 0
+
+    # 视频帧率(每秒帧数)
+    def get_video_frame_rate(self):
+        try:
+            if self.__video_streams.get('avg_frame_rate'):
+                return round(eval(self.__video_streams.get('avg_frame_rate')), 4)
+            if self.__video_streams.get('r_frame_rate'):
+                return round(eval(self.__video_streams.get('r_frame_rate')), 4)
+        except ZeroDivisionError as e:
+            pass
+        return 0
+
+    # 视频码率，1000进制
+    def get_video_bit_rate(self):
+        if self.__video_streams.get('bit_rate'):
+            return int(self.__video_streams.get('bit_rate'))
+        return 0
+
+    # 视频帧数
+    def get_video_nb_frames(self):
+        if self.__video_streams.get('nb_frames'):
+            return int(self.__video_streams.get('nb_frames'))
+        return 0
+
+    # 所有音轨编码
+    def get_audio_codec_name(self):
+        if self.__audio_streams:
+            return [{'index': i.get('index'), 'codec_name':i.get('codec_name')} for i in self.__audio_streams]
+        return []
+
+    # 所有音轨时长(s)
+    def get_audio_duration(self):
+        if self.__audio_streams:
+            return [{'index': i.get('index'), 'duration': round(float(i.get('duration')),4)} for i in self.__audio_streams]
+        return []
+
+    # 所有音轨采样率
+    def get_audio_sample_rate(self):
+        if self.__audio_streams:
+            return [{'index': i.get('index'), 'sample_rate': int(i.get('sample_rate'))} for i in self.__audio_streams]
+        return []
+
+    # 所有音轨采样率
+    def get_audio_nb_frames(self):
+        if self.__audio_streams:
+            return [{'index': i.get('index'), 'nb_frames': int(i.get('nb_frames'))} for i in self.__audio_streams]
+        return []
+
+
+if __name__ == '__main__':
+    media = MediaFile("https://xxx.com/3074400a327aef9cca791925928553b0735bdf11",auto_download=True)
+    print('文件md5:', media.get_file_md5())
+    print('文件大小:', media.get_format_size())
+    print('视频宽度:', media.get_video_codec_width())
+    print('视频高度:', media.get_video_codec_height())
+    print('视频编码:', media.get_video_codec_name())
+    print('视频时长:', media.get_video_duration())
+    print('视频码率:', media.get_video_bit_rate())
+    print('视频帧率:', media.get_video_frame_rate())
+    print('视频码数:', media.get_video_nb_frames())
+
+    print('音频编码:', media.get_audio_codec_name())
+    print('音频时长:', media.get_audio_duration())
+    print('音频帧数:', media.get_audio_nb_frames())
+    print('是否静音:', media.is_quiet_video)
+    print('音频采样率:', media.get_audio_sample_rate())
+
+    media = MediaFile('https://xxx.com/5ea4e9fd48ed9ce6df9b66fb0758082fa6de9363',auto_download=True)
+    print('文件md5:', media.get_file_md5())
+    print('文件码率:', media.get_format_bit_rate())
+    print('文件大小:', media.get_format_size())
+    print('视频宽度:', media.get_video_codec_width())
+    print('视频高度:', media.get_video_codec_height())
+    print('视频编码:', media.get_video_codec_name())
+    print('视频时长:', media.get_video_duration())
+    print('视频码率:', media.get_video_bit_rate())
+    print('视频帧率:', media.get_video_frame_rate())
+    print('视频码数:', media.get_video_nb_frames())
+
+    print('音频编码:', media.get_audio_codec_name())
+    print('音频时长:', media.get_audio_duration())
+    print('音频帧数:', media.get_audio_nb_frames())
+    print('是否静音:', media.is_quiet_video)
+    print('音频采样率:', media.get_audio_sample_rate())
+
+    media = MediaFile('https://xxx.com/b03db1cc4a67c9bb793a0bd9f47cba68b9433644?imageView2/2/w/1080',auto_download=True)
+    print('文件md5:', media.get_file_md5())
+    print('文件大小:', media.get_format_size())
+    print('视频宽度:', media.get_video_codec_width())
+    print('视频高度:', media.get_video_codec_height())
+    print('视频编码:', media.get_video_codec_name())
+    print('视频时长:', media.get_video_duration())
+    print('视频码率:', media.get_video_bit_rate())
+    print('视频帧率:', media.get_video_frame_rate())
+    print('视频码数:', media.get_video_nb_frames())
+
+    print('音频编码:', media.get_audio_codec_name())
+    print('音频时长:', media.get_audio_duration())
+    print('音频帧数:', media.get_audio_nb_frames())
+    print('是否静音:', media.is_quiet_video)
+    print('音频采样率:', media.get_audio_sample_rate())
+
